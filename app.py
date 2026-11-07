@@ -171,7 +171,7 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
     return img
 
 def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
-    """Отправляет фото в GPTunnel и проверяет доступные модели."""
+    """Отправляет фото в GPTunnel."""
     img = img.resize((1024, 1024), Image.Resampling.LANCZOS)
     buffered = io.BytesIO()
     img.save(buffered, format="JPEG")
@@ -182,27 +182,22 @@ def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
         "Content-Type": "application/json"
     }
     
-    try:
-        # ВРЕМЕННЫЙ БЛОК ДЛЯ ПРОВЕРКИ МОДЕЛЕЙ
-        models_response = requests.get("https://gptunnel.ru/v1/models", headers=headers)
-        st.write("Список моделей от GPTunnel:", models_response.json())
-        
-        with st.spinner("Нейросеть колдует..."):
-            # Меняем ID модели, если нужно будет
-            payload = {
-                "model": "gpt-image-1", 
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                        ]
-                    }
-                ],
-                "max_tokens": 1000
+    payload = {
+        "model": "nano-banana-2-lite", # Название с твоего скриншота
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                ]
             }
-            
+        ],
+        "max_tokens": 1000
+    }
+    
+    try:
+        with st.spinner("Нейросеть колдует..."):
             response = requests.post(
                 "https://gptunnel.ru/v1/chat/completions", 
                 headers=headers, 

@@ -172,7 +172,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
 
 def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
     """Отправляет фото в GPTunnel (через Chat Completions, как Gemini)."""
-    # Конвертируем фото в base64
     img = img.resize((1024, 1024), Image.Resampling.LANCZOS)
     buffered = io.BytesIO()
     img.save(buffered, format="JPEG")
@@ -183,9 +182,9 @@ def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
         "Content-Type": "application/json"
     }
     
-    # Формат запроса для Gemini (Nano Banana) через текстовый чат
+    # Пробуем gpt-image-1
     payload = {
-        "model": "nano-banana-v1", # Пробуем этот ID
+        "model": "gpt-image-1",
         "messages": [
             {
                 "role": "user",
@@ -199,8 +198,7 @@ def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
     }
     
     try:
-        with st.spinner("Нейросеть Nano Banana колдует..."):
-            # Отправляем стандартный POST-запрос
+        with st.spinner("Нейросеть колдует..."):
             response = requests.post(
                 "https://gptunnel.ru/v1/chat/completions", 
                 headers=headers, 
@@ -213,10 +211,8 @@ def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
                 return img
                 
             data = response.json()
-            # В ответе Gemini обычно возвращает текст, но если это картинка — она будет в base64
             content = data["choices"][0]["message"]["content"]
             
-            # Ищем base64 картинку в ответе (иногда они оборачивают её в markdown)
             if "base64," in content:
                 b64_str = content.split("base64,")[1].split(")")[0].split('"')[0]
                 return Image.open(io.BytesIO(base64.b64decode(b64_str)))

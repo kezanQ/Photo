@@ -2,25 +2,17 @@ import re
 import io
 import cv2
 import base64
+import requests
 import numpy as np
-import urllib.request
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.ndimage import gaussian_filter
 from streamlit_drawable_canvas import st_canvas
-from openai import OpenAI
 
 SCALE = 100.0
 
-# --- Инициализация GPTunnel (совместим с OpenAI) ---
+# --- Получаем ключ из Secrets ---
 api_key = st.secrets.get("OPENAI_API_KEY", None)
-if api_key:
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://gptunnel.ru/v1" # Адрес API GPTunnel
-    )
-else:
-    client = None
 
 @st.cache_resource
 def load_face_cascade():
@@ -37,7 +29,6 @@ def auto_enhance_params(img: Image.Image) -> dict:
     arr = np.asarray(img.convert("RGB")).astype(np.float32) / 255.0
     r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     lum = 0.299 * r + 0.587 * g + 0.114 * b
-    
     p_dark = np.percentile(lum, 10)
     p_bright = np.percentile(lum, 90)
     
@@ -48,7 +39,6 @@ def auto_enhance_params(img: Image.Image) -> dict:
     if p_dark < 0.2:
         params["shadows"] = 30
         params["blacks"] = 10
-        
     params["saturation"] = -10
     params["vibrance"] = 10
     params["clarity"] = 15
@@ -73,16 +63,12 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = arr.astype(np.float32)
 
     arr = arr / 255.0
-    if "exposure" in p:
-        arr *= 2.0 ** p["exposure"]
+    if "exposure" in p: arr *= 2.0 ** p["exposure"]
     arr = np.clip(arr, 0, 1)
 
     temp_img = Image.fromarray((arr * 255).astype(np.uint8))
-    if "contrast" in p:
-        temp_img = ImageEnhance.Contrast(temp_img).enhance(max(0, 1 + p["contrast"] / SCALE))
-    if "saturation" in p:
-        temp_img = ImageEnhance.Color(temp_img).enhance(max(0, 1 + p["saturation"] / SCALE))
-    
+    if "contrast" in p: temp_img = ImageEnhance.Contrast(temp_img).enhance(max(0, 1 + p["contrast"] / SCALE))
+    if "saturation" in p: temp_img = ImageEnhance.Color(temp_img).enhance(max(0, 1 + p["saturation"] / SCALE))
     arr = np.asarray(temp_img).astype(np.float32) / 255.0
 
     if any(k in p for k in ["shadows", "highlights", "blacks", "whites"]):
@@ -184,41 +170,74 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
 
     return img
 
-def openai_edit_image(img: Image.Image, prompt: str) -> Image.Image:
-    """Отправляет фото в GPTunnel для генеративного улучшения."""
+def gptunnel_edit_image(img: Image.Image, prompt: str) -> Image.Image:
+    """Отправляет фото в GPTunnel (через Chat Completions, как Gemini)."""
+    # Конвертируем фото в base64
     img = img.resize((1024, 1024), Image.Resampling.LANCZOS)
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG")
+    img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    img_byte_arr = io.BytesIO()
-    img.save(img_byte_arr, format='PNG')
-    img_byte_arr = img_byte_arr.getvalue()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Формат запроса для Gemini (Nano Banana) через текстовый чат
+    payload = {
+        "model": "nano-banana-v1", # Пробуем этот ID
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                ]
+            }
+        ],
+        "max_tokens": 1000
+    }
     
     try:
-        with st.spinner("Нейросеть творит магию (15-20 сек)..."):
-            # ВАЖНО: Изменили модель на dall-e-3
-            response = client.images.edit(
-                model="dall-e-3",
-                image=("image.png", img_byte_arr, "image/png"),
-                prompt=prompt,
-                n=1,
-                size="1024x1024"
+        with st.spinner("Нейросеть Nano Banana колдует..."):
+            # Отправляем стандартный POST-запрос
+            response = requests.post(
+                "https://gptunnel.ru/v1/chat/completions", 
+                headers=headers, 
+                json=payload,
+                timeout=60
             )
-            b64_img = response.data[0].b64_json
-            return Image.open(io.BytesIO(base64.b64decode(b64_img)))
+            
+            if response.status_code != 200:
+                st.error(f"Ошибка {response.status_code}: {response.text}")
+                return img
+                
+            data = response.json()
+            # В ответе Gemini обычно возвращает текст, но если это картинка — она будет в base64
+            content = data["choices"][0]["message"]["content"]
+            
+            # Ищем base64 картинку в ответе (иногда они оборачивают её в markdown)
+            if "base64," in content:
+                b64_str = content.split("base64,")[1].split(")")[0].split('"')[0]
+                return Image.open(io.BytesIO(base64.b64decode(b64_str)))
+            else:
+                st.warning("Нейросеть вернула текст вместо картинки. Попробуй промт: 'Отредактируй это фото и верни результат'")
+                return img
+                
     except Exception as e:
-        st.error(f"Ошибка API: {e}")
+        st.error(f"Ошибка запроса: {e}")
         return img
 
 st.set_page_config(page_title="Photo Prompt App AI", layout="wide")
 st.title("📷 Photo Prompt App (AI)")
 
-if not client:
+if not api_key:
     st.warning("⚠️ API-ключ не найден в Secrets. Работает только базовый режим.")
 
 col1, col2 = st.columns(2)
 
 with col1:
     file = st.file_uploader("Загрузи фото", type=["jpg", "jpeg", "png", "webp"])
-    
     app_mode = st.radio("Режим работы:", ["Быстрый (математика)", "ИИ (GPTunnel)"])
 
     if app_mode == "Быстрый (математика)":
@@ -227,8 +246,8 @@ with col1:
         do_denoise = st.checkbox("🧹 Убрать шум")
         do_faces = st.checkbox("👤 Улучшить лица")
     else:
-        st.info("💡 Опиши текстом, что хочешь изменить. Чем точнее — тем лучше.")
-        ai_prompt = st.text_area("Промт для нейросети:", "Сделай фотографию профессиональной, высокого качества. Убери цифровой шум. Сделай цвета насыщеннее, но не пересвечивай. Сохрани все детали, номер машины и формы в точности как на оригинале.")
+        st.info("💡 Опиши текстом, что хочешь изменить.")
+        ai_prompt = st.text_area("Промт для нейросети:", "Сделай фотографию профессиональной и качественной. Убери шум, сделай цвета насыщеннее. Верни только готовое изображение.")
 
     run = st.button("Применить", type="primary")
 
@@ -237,10 +256,10 @@ if file:
     
     if run:
         if app_mode == "ИИ (GPTunnel)":
-            if not client:
-                st.error("Для этого режима нужен API-ключ.")
+            if not api_key:
+                st.error("Нужен API-ключ.")
             else:
-                result = openai_edit_image(original, ai_prompt)
+                result = gptunnel_edit_image(original, ai_prompt)
                 with col2:
                     st.image(result, caption="После (Нейросеть)", use_container_width=True)
                     buf = io.BytesIO()

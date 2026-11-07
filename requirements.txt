@@ -3,3 +3,5 @@ pillow
 numpy
 scipy
 streamlit-drawable-canvas
+opencv-python-headless
+mediapipe

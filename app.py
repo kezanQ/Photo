@@ -4,6 +4,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.ndimage import gaussian_filter
+from skimage import color
 
 SCALE = 100.0
 
@@ -17,80 +18,95 @@ def parse_prompt(text: str) -> dict:
 
 def apply_params(img: Image.Image, p: dict) -> Image.Image:
     img = img.convert("RGB")
-    arr = np.asarray(img).astype(np.float32)
+    arr = np.asarray(img).astype(np.float32) / 255.0
 
+    # 1. Шумоподавление
     if p.get("denoise", 0) > 0:
         s = p["denoise"] / SCALE * 2.0
         arr = gaussian_filter(arr, sigma=(s, s, 0))
 
+    # 2. Экспозиция
     if "exposure" in p:
         arr *= 2.0 ** p["exposure"]
 
-    arr = np.clip(arr, 0, 255)
-    lum = arr.mean(axis=2, keepdims=True)
+    arr = np.clip(arr, 0, 1)
 
-    if "shadows" in p:
-        mask = np.clip((128 - lum) / 128, 0, 1)
-        arr += mask * (p["shadows"] / SCALE) * 80
-    if "highlights" in p:
-        mask = np.clip((lum - 128) / 128, 0, 1)
-        arr += mask * (p["highlights"] / SCALE) * 80
-    if "blacks" in p:
-        mask = np.clip((64 - lum) / 64, 0, 1)
-        arr += mask * (p["blacks"] / SCALE) * 60
-    if "whites" in p:
-        mask = np.clip((lum - 192) / 64, 0, 1)
-        arr += mask * (p["whites"] / SCALE) * 60
+    # 3. Контраст, насыщенность (через PIL, это безопасно)
+    temp_img = Image.fromarray((arr * 255).astype(np.uint8))
+    if "contrast" in p:
+        temp_img = ImageEnhance.Contrast(temp_img).enhance(max(0, 1 + p["contrast"] / SCALE))
+    if "saturation" in p:
+        temp_img = ImageEnhance.Color(temp_img).enhance(max(0, 1 + p["saturation"] / SCALE))
+    
+    arr = np.asarray(temp_img).astype(np.float32) / 255.0
 
-    arr = np.clip(arr, 0, 255)
+    # 4. Тени, света, черные/белые точки (работаем в LAB, чтобы не портить цвета)
+    if any(k in p for k in ["shadows", "highlights", "blacks", "whites"]):
+        lab = color.rgb2lab(arr)
+        L = lab[:, :, 0] # Канал яркости (0-100)
 
+        if "shadows" in p:
+            mask = np.clip((50 - L) / 50, 0, 1)
+            L += mask * (p["shadows"] / SCALE) * 30
+        if "highlights" in p:
+            mask = np.clip((L - 50) / 50, 0, 1)
+            L += mask * (p["highlights"] / SCALE) * 30
+        if "blacks" in p:
+            mask = np.clip((20 - L) / 20, 0, 1)
+            L += mask * (p["blacks"] / SCALE) * 20
+        if "whites" in p:
+            mask = np.clip((L - 80) / 20, 0, 1)
+            L += mask * (p["whites"] / SCALE) * 20
+
+        lab[:, :, 0] = np.clip(L, 0, 100)
+        arr = color.lab2rgb(lab)
+        arr = np.clip(arr, 0, 1)
+
+    # 5. Температура и оттенок
     if "temperature" in p:
         t = p["temperature"] / 1000.0
-        arr[..., 0] += t * 30
-        arr[..., 2] -= t * 30
+        arr[..., 0] += t * 0.1
+        arr[..., 2] -= t * 0.1
     if "tint" in p:
         g = p["tint"] / SCALE
-        arr[..., 1] -= g * 20
-        arr[..., 0] += g * 10
-        arr[..., 2] += g * 10
+        arr[..., 1] -= g * 0.05
+        arr[..., 0] += g * 0.02
+        arr[..., 2] += g * 0.02
 
-    arr = np.clip(arr, 0, 255)
-    img = Image.fromarray(arr.astype(np.uint8))
+    arr = np.clip(arr, 0, 1)
 
-    if "contrast" in p:
-        img = ImageEnhance.Contrast(img).enhance(max(0, 1 + p["contrast"] / SCALE))
-    if "saturation" in p:
-        img = ImageEnhance.Color(img).enhance(max(0, 1 + p["saturation"] / SCALE))
-
+    # 6. Vibrance (умная насыщенность)
     if "vibrance" in p:
-        arr = np.asarray(img).astype(np.float32)
-        mx = arr.max(axis=2, keepdims=True)
-        mn = arr.min(axis=2, keepdims=True)
-        sat = (mx - mn) / (mx + 1e-6)
-        boost = (p["vibrance"] / SCALE) * (1 - sat) * 60
-        gray = arr.mean(axis=2, keepdims=True)
-        arr = arr + boost * (arr - gray)
-        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        hsv = color.rgb2hsv(arr)
+        s = hsv[:, :, 1]
+        boost = (p["vibrance"] / SCALE) * (1 - s) * 0.3
+        hsv[:, :, 1] = np.clip(s + boost, 0, 1)
+        arr = color.hsv2rgb(hsv)
 
+    # 7. Clarity
     if "clarity" in p:
-        arr = np.asarray(img).astype(np.float32)
-        blurred = gaussian_filter(arr, sigma=(8, 8, 0))
-        arr = arr + (p["clarity"] / SCALE) * (arr - blurred)
-        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        arr_float = arr.astype(np.float32)
+        blurred = gaussian_filter(arr_float, sigma=(8, 8, 0))
+        arr = arr_float + (p["clarity"] / SCALE) * (arr_float - blurred)
+        arr = np.clip(arr, 0, 1)
 
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # 8. Резкость
     if p.get("sharpen", 0) > 0:
         img = img.filter(ImageFilter.UnsharpMask(
             radius=2, percent=int(p["sharpen"]), threshold=3))
 
+    # 9. Виньетка
     if "vignette" in p:
-        arr = np.asarray(img).astype(np.float32)
+        arr = np.asarray(img).astype(np.float32) / 255.0
         h, w = arr.shape[:2]
         yy, xx = np.mgrid[0:h, 0:w]
         cx, cy = w / 2, h / 2
         dist = np.sqrt(((xx - cx) / w) ** 2 + ((yy - cy) / h) ** 2)
         mask = np.clip(dist * 1.4, 0, 1)[..., None]
         arr = arr * (1 + (p["vignette"] / SCALE) * mask)
-        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
     return img
 

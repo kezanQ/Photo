@@ -2,6 +2,7 @@ import re
 import io
 import cv2
 import numpy as np
+import urllib.request
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.ndimage import gaussian_filter
@@ -9,8 +10,59 @@ from streamlit_drawable_canvas import st_canvas
 
 SCALE = 100.0
 
-# Загружаем каскад Хаара для поиска лиц (встроен в OpenCV)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# --- Загрузка каскада для лиц (скачиваем, если нет) ---
+@st.cache_resource
+def load_face_cascade():
+    url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+    try:
+        # Пробуем взять локально
+        path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        cascade = cv2.CascadeClassifier(path)
+        if cascade.empty():
+            raise Exception("Empty")
+        return cascade
+    except:
+        # Если не вышло — качаем во временный файл
+        filename = "haarcascade_frontalface_default.xml"
+        urllib.request.urlretrieve(url, filename)
+        return cv2.CascadeClassifier(filename)
+
+face_cascade = load_face_cascade()
+
+# --- АВТОАНАЛИЗ ИЗОБРАЖЕНИЯ ---
+def auto_enhance_params(img: Image.Image) -> dict:
+    arr = np.asarray(img.convert("RGB")).astype(np.float32) / 255.0
+    r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    
+    mean_lum = np.mean(lum)
+    dark_ratio = np.mean(lum < 0.15)
+    bright_ratio = np.mean(lum > 0.85)
+    
+    maxc = arr.max(axis=2)
+    minc = arr.min(axis=2)
+    sat = (maxc - minc) / (maxc + 1e-6)
+    mean_sat = np.mean(sat)
+    
+    params = {}
+    if mean_lum < 0.35:
+        params["exposure"] = min(1.0, (0.45 - mean_lum) * 2)
+    elif mean_lum > 0.7:
+        params["exposure"] = max(-0.8, (0.6 - mean_lum) * 2)
+        
+    if dark_ratio > 0.1:
+        params["shadows"] = min(60, int(dark_ratio * 100))
+    if bright_ratio > 0.05:
+        params["highlights"] = max(-50, -int(bright_ratio * 100))
+    if mean_sat < 0.25:
+        params["vibrance"] = min(40, int((0.3 - mean_sat) * 150))
+        
+    contrast_std = np.std(lum)
+    if contrast_std < 0.15:
+        params["contrast"] = 15
+    if not params:
+        params["clarity"] = 10
+    return params
 
 def parse_prompt(text: str) -> dict:
     params = {}
@@ -24,19 +76,16 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
     img = img.convert("RGB")
     arr = np.asarray(img).astype(np.float32)
 
-    # 1. Шумоподавление (OpenCV)
     if do_denoise or p.get("denoise", 0) > 0:
         h = int(p.get("denoise", 10))
         arr = cv2.fastNlMeansDenoisingColored(arr.astype(np.uint8), None, h, h, 7, 21)
         arr = arr.astype(np.float32)
 
-    # 2. Экспозиция
     arr = arr / 255.0
     if "exposure" in p:
         arr *= 2.0 ** p["exposure"]
     arr = np.clip(arr, 0, 1)
 
-    # 3. Контраст и насыщенность
     temp_img = Image.fromarray((arr * 255).astype(np.uint8))
     if "contrast" in p:
         temp_img = ImageEnhance.Contrast(temp_img).enhance(max(0, 1 + p["contrast"] / SCALE))
@@ -45,7 +94,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
     
     arr = np.asarray(temp_img).astype(np.float32) / 255.0
 
-    # 4. Тени и света (YCbCr)
     if any(k in p for k in ["shadows", "highlights", "blacks", "whites"]):
         r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
         y = 0.299 * r + 0.587 * g + 0.114 * b
@@ -69,7 +117,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = np.stack([y + cr, y - 0.344136 * cb - 0.714136 * cr, y + cb], axis=-1)
         arr = np.clip(arr, 0, 1)
 
-    # 5. Температура и оттенок
     if "temperature" in p:
         t = p["temperature"] / 1000.0
         arr[..., 0] += t * 0.1
@@ -81,7 +128,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr[..., 2] += g * 0.02
     arr = np.clip(arr, 0, 1)
 
-    # 6. Vibrance
     if "vibrance" in p:
         maxc = arr.max(axis=2, keepdims=True)
         minc = arr.min(axis=2, keepdims=True)
@@ -91,7 +137,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = arr + boost * (arr - gray)
         arr = np.clip(arr, 0, 1)
 
-    # 7. Clarity
     if "clarity" in p:
         blurred = gaussian_filter(arr, sigma=(8, 8, 0))
         arr = arr + (p["clarity"] / SCALE) * (arr - blurred)
@@ -99,11 +144,9 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
 
     img = Image.fromarray((arr * 255).astype(np.uint8))
 
-    # 8. Резкость
     if p.get("sharpen", 0) > 0:
         img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=int(p["sharpen"]), threshold=3))
 
-    # 9. Виньетка
     if "vignette" in p:
         arr = np.asarray(img).astype(np.float32) / 255.0
         h, w = arr.shape[:2]
@@ -114,32 +157,36 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = arr * (1 + (p["vignette"] / SCALE) * mask)
         img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
-    # 10. Улучшение лиц (OpenCV Каскады)
+    # 10. Улучшение лиц
     if do_faces:
         img_arr = np.asarray(img).astype(np.float32)
-        gray = cv2.cvtColor(img_arr.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        h, w = img_arr.shape[:2]
         
-        # Ищем лица
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        # Уменьшаем фото до 1000px, чтобы не переполнять память
+        h_orig, w_orig = img_arr.shape[:2]
+        scale = min(1.0, 1000.0 / max(h_orig, w_orig))
+        if scale < 1.0:
+            img_small = cv2.resize(img_arr, (int(w_orig*scale), int(h_orig*scale)))
+        else:
+            img_small = img_arr
+
+        gray = cv2.cvtColor(img_small.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         
         if len(faces) > 0:
-            face_mask = np.zeros((h, w), dtype=np.float32)
-            
+            face_mask_small = np.zeros(gray.shape, dtype=np.float32)
             for (x, y, w_face, h_face) in faces:
-                # Расширяем прямоугольник на 20% для захвата подбородка и лба
                 pad_w = int(w_face * 0.2)
                 pad_h = int(h_face * 0.2)
                 x1, y1 = max(0, x - pad_w), max(0, y - pad_h)
-                x2, y2 = min(w, x + w_face + pad_w), min(h, y + h_face + pad_h)
-                
-                cv2.rectangle(face_mask, (x1, y1), (x2, y2), 1.0, -1)
+                x2, y2 = min(gray.shape[1], x + w_face + pad_w), min(gray.shape[0], y + h_face + pad_h)
+                cv2.rectangle(face_mask_small, (x1, y1), (x2, y2), 1.0, -1)
             
-            # Размываем маску, чтобы переходы были плавными
-            face_mask = gaussian_filter(face_mask, sigma=15)
+            face_mask_small = gaussian_filter(face_mask_small, sigma=10)
+            
+            # Возвращаем маску к оригинальному размеру
+            face_mask = cv2.resize(face_mask_small, (w_orig, h_orig))
             face_mask = face_mask[:, :, None]
             
-            # Делаем лица светлее и мягче
             face_soft = cv2.GaussianBlur(img_arr, (15, 15), 0)
             face_bright = img_arr * 1.15
             
@@ -156,10 +203,12 @@ col1, col2 = st.columns(2)
 with col1:
     file = st.file_uploader("Загрузи фото", type=["jpg", "jpeg", "png", "webp"])
     
+    auto_mode = st.checkbox("✨ Улучшить автоматически (ИИ проанализирует фото)")
+    
     prompt_text = st.text_area(
-        "Вставь блок параметров",
+        "Или вставь свой блок параметров",
         height=150,
-        placeholder="exposure: +0.3\nshadows: +40\nvibrance: +20\n..."
+        placeholder="exposure: +0.3\nshadows: +40\n..."
     )
     
     st.subheader("Умные функции")
@@ -170,7 +219,6 @@ with col1:
     
     canvas_result = None
     if file and mode == "Рисовать маску (точечно)":
-        st.info("Закрась пальцем область, к которой применить эффект.")
         original = Image.open(file).convert("RGB")
         w, h = original.size
         max_size = 800
@@ -194,8 +242,15 @@ with col1:
 if file:
     original = Image.open(file).convert("RGB")
     
-    if run and prompt_text.strip():
-        params = parse_prompt(prompt_text)
+    if run:
+        params = {}
+        
+        if auto_mode:
+            params = auto_enhance_params(original)
+            st.info(f"🤖 ИИ решил применить: {params}")
+        elif prompt_text.strip():
+            params = parse_prompt(prompt_text)
+            
         if not params and not do_denoise and not do_faces:
             st.error("Нет параметров и не выбраны умные функции!")
         else:
@@ -203,7 +258,7 @@ if file:
                 if mode == "Рисовать маску (точечно)" and canvas_result is not None and canvas_result.image_data is not None:
                     mask_raw = canvas_result.image_data[:, :, 3]
                     if mask_raw.sum() == 0:
-                        st.warning("Ты не закрасил(а) ни одной области! Применяю ко всему фото.")
+                        st.warning("Область не закрашена! Применяю ко всему фото.")
                         result = apply_params(original, params, do_denoise, do_faces)
                     else:
                         mask_img = Image.fromarray((mask_raw * 255).astype(np.uint8))

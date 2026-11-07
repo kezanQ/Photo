@@ -4,7 +4,6 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.ndimage import gaussian_filter
-from skimage import color
 
 SCALE = 100.0
 
@@ -31,7 +30,7 @@ def apply_params(img: Image.Image, p: dict) -> Image.Image:
 
     arr = np.clip(arr, 0, 1)
 
-    # 3. Контраст, насыщенность (через PIL, это безопасно)
+    # 3. Контраст и насыщенность
     temp_img = Image.fromarray((arr * 255).astype(np.uint8))
     if "contrast" in p:
         temp_img = ImageEnhance.Contrast(temp_img).enhance(max(0, 1 + p["contrast"] / SCALE))
@@ -40,26 +39,30 @@ def apply_params(img: Image.Image, p: dict) -> Image.Image:
     
     arr = np.asarray(temp_img).astype(np.float32) / 255.0
 
-    # 4. Тени, света, черные/белые точки (работаем в LAB, чтобы не портить цвета)
+    # 4. Тени и света (через яркость Y, чтобы не портить цвета)
     if any(k in p for k in ["shadows", "highlights", "blacks", "whites"]):
-        lab = color.rgb2lab(arr)
-        L = lab[:, :, 0] # Канал яркости (0-100)
+        # Перевод в YCbCr (Яркость, Синий, Красный) - есть в чистом numpy
+        r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = b - y
+        cr = r - y
 
         if "shadows" in p:
-            mask = np.clip((50 - L) / 50, 0, 1)
-            L += mask * (p["shadows"] / SCALE) * 30
+            mask = np.clip((0.5 - y) / 0.5, 0, 1)
+            y += mask * (p["shadows"] / SCALE) * 0.3
         if "highlights" in p:
-            mask = np.clip((L - 50) / 50, 0, 1)
-            L += mask * (p["highlights"] / SCALE) * 30
+            mask = np.clip((y - 0.5) / 0.5, 0, 1)
+            y += mask * (p["highlights"] / SCALE) * 0.3
         if "blacks" in p:
-            mask = np.clip((20 - L) / 20, 0, 1)
-            L += mask * (p["blacks"] / SCALE) * 20
+            mask = np.clip((0.2 - y) / 0.2, 0, 1)
+            y += mask * (p["blacks"] / SCALE) * 0.2
         if "whites" in p:
-            mask = np.clip((L - 80) / 20, 0, 1)
-            L += mask * (p["whites"] / SCALE) * 20
+            mask = np.clip((y - 0.8) / 0.2, 0, 1)
+            y += mask * (p["whites"] / SCALE) * 0.2
 
-        lab[:, :, 0] = np.clip(L, 0, 100)
-        arr = color.lab2rgb(lab)
+        y = np.clip(y, 0, 1)
+        # Сборка обратно
+        arr = np.stack([y + cr, y - 0.344136 * cb - 0.714136 * cr, y + cb], axis=-1)
         arr = np.clip(arr, 0, 1)
 
     # 5. Температура и оттенок
@@ -75,19 +78,20 @@ def apply_params(img: Image.Image, p: dict) -> Image.Image:
 
     arr = np.clip(arr, 0, 1)
 
-    # 6. Vibrance (умная насыщенность)
+    # 6. Vibrance
     if "vibrance" in p:
-        hsv = color.rgb2hsv(arr)
-        s = hsv[:, :, 1]
-        boost = (p["vibrance"] / SCALE) * (1 - s) * 0.3
-        hsv[:, :, 1] = np.clip(s + boost, 0, 1)
-        arr = color.hsv2rgb(hsv)
+        maxc = arr.max(axis=2, keepdims=True)
+        minc = arr.min(axis=2, keepdims=True)
+        sat = (maxc - minc) / (maxc + 1e-6)
+        boost = (p["vibrance"] / SCALE) * (1 - sat) * 0.3
+        gray = arr.mean(axis=2, keepdims=True)
+        arr = arr + boost * (arr - gray)
+        arr = np.clip(arr, 0, 1)
 
     # 7. Clarity
     if "clarity" in p:
-        arr_float = arr.astype(np.float32)
-        blurred = gaussian_filter(arr_float, sigma=(8, 8, 0))
-        arr = arr_float + (p["clarity"] / SCALE) * (arr_float - blurred)
+        blurred = gaussian_filter(arr, sigma=(8, 8, 0))
+        arr = arr + (p["clarity"] / SCALE) * (arr - blurred)
         arr = np.clip(arr, 0, 1)
 
     img = Image.fromarray((arr * 255).astype(np.uint8))

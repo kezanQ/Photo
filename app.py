@@ -10,58 +10,55 @@ from streamlit_drawable_canvas import st_canvas
 
 SCALE = 100.0
 
-# --- Загрузка каскада для лиц (скачиваем, если нет) ---
 @st.cache_resource
 def load_face_cascade():
     url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
     try:
-        # Пробуем взять локально
         path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         cascade = cv2.CascadeClassifier(path)
-        if cascade.empty():
-            raise Exception("Empty")
+        if cascade.empty(): raise Exception("Empty")
         return cascade
     except:
-        # Если не вышло — качаем во временный файл
         filename = "haarcascade_frontalface_default.xml"
         urllib.request.urlretrieve(url, filename)
         return cv2.CascadeClassifier(filename)
 
 face_cascade = load_face_cascade()
 
-# --- АВТОАНАЛИЗ ИЗОБРАЖЕНИЯ ---
+# --- НОВЫЙ УМНЫЙ АВТОАНАЛИЗ ---
 def auto_enhance_params(img: Image.Image) -> dict:
     arr = np.asarray(img.convert("RGB")).astype(np.float32) / 255.0
+    
+    # Считаем яркость
     r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     
-    mean_lum = np.mean(lum)
-    dark_ratio = np.mean(lum < 0.15)
-    bright_ratio = np.mean(lum > 0.85)
-    
-    maxc = arr.max(axis=2)
-    minc = arr.min(axis=2)
-    sat = (maxc - minc) / (maxc + 1e-6)
-    mean_sat = np.mean(sat)
+    # Анализ гистограммы
+    p_dark = np.percentile(lum, 10)   # Самые темные 10% пикселей
+    p_bright = np.percentile(lum, 90) # Самые светлые 10% пикселей
     
     params = {}
-    if mean_lum < 0.35:
-        params["exposure"] = min(1.0, (0.45 - mean_lum) * 2)
-    elif mean_lum > 0.7:
-        params["exposure"] = max(-0.8, (0.6 - mean_lum) * 2)
+    
+    # Если на фото есть яркие источники света (как гирлянда)
+    if p_bright > 0.7:
+        params["highlights"] = -40  # Приглушаем их, чтобы не слепили
+        params["exposure"] = -0.1   # Чуть-чуть убавляем общую яркость
+    
+    # Если много темных провалов
+    if p_dark < 0.2:
+        params["shadows"] = 30      # Аккуратно поднимаем тени
+        params["blacks"] = 10       # И чуть-чуть черную точку
         
-    if dark_ratio > 0.1:
-        params["shadows"] = min(60, int(dark_ratio * 100))
-    if bright_ratio > 0.05:
-        params["highlights"] = max(-50, -int(bright_ratio * 100))
-    if mean_sat < 0.25:
-        params["vibrance"] = min(40, int((0.3 - mean_sat) * 150))
-        
-    contrast_std = np.std(lum)
-    if contrast_std < 0.15:
-        params["contrast"] = 15
-    if not params:
-        params["clarity"] = 10
+    # Защита от «ядовитых» цветов на ночных фото
+    # Убавляем общую насыщенность, чтобы убрать кислотность
+    params["saturation"] = -10
+    # Но добавляем вибранс (он умный и не трогает кожу)
+    params["vibrance"] = 10
+    
+    # Добавляем объема
+    params["clarity"] = 15
+    params["sharpen"] = 20
+    
     return params
 
 def parse_prompt(text: str) -> dict:
@@ -157,11 +154,8 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = arr * (1 + (p["vignette"] / SCALE) * mask)
         img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
-    # 10. Улучшение лиц
     if do_faces:
         img_arr = np.asarray(img).astype(np.float32)
-        
-        # Уменьшаем фото до 1000px, чтобы не переполнять память
         h_orig, w_orig = img_arr.shape[:2]
         scale = min(1.0, 1000.0 / max(h_orig, w_orig))
         if scale < 1.0:
@@ -182,8 +176,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
                 cv2.rectangle(face_mask_small, (x1, y1), (x2, y2), 1.0, -1)
             
             face_mask_small = gaussian_filter(face_mask_small, sigma=10)
-            
-            # Возвращаем маску к оригинальному размеру
             face_mask = cv2.resize(face_mask_small, (w_orig, h_orig))
             face_mask = face_mask[:, :, None]
             
@@ -203,7 +195,7 @@ col1, col2 = st.columns(2)
 with col1:
     file = st.file_uploader("Загрузи фото", type=["jpg", "jpeg", "png", "webp"])
     
-    auto_mode = st.checkbox("✨ Улучшить автоматически (ИИ проанализирует фото)")
+    auto_mode = st.checkbox("✨ Улучшить автоматически (Умный анализ)", value=True)
     
     prompt_text = st.text_area(
         "Или вставь свой блок параметров",
@@ -213,7 +205,7 @@ with col1:
     
     st.subheader("Умные функции")
     do_denoise = st.checkbox("🧹 Убрать шум (OpenCV AI)")
-    do_faces = st.checkbox("👤 Улучшить лица (свет + мягкая кожа)")
+    do_faces = st.checkbox("👤 Улучшить лица")
     
     mode = st.radio("Режим работы:", ["Применить ко всему фото", "Рисовать маску (точечно)"], horizontal=True)
     
@@ -247,7 +239,7 @@ if file:
         
         if auto_mode:
             params = auto_enhance_params(original)
-            st.info(f"🤖 ИИ решил применить: {params}")
+            st.info(f"🤖 Умный анализ применил: {params}")
         elif prompt_text.strip():
             params = parse_prompt(prompt_text)
             

@@ -2,7 +2,6 @@ import re
 import io
 import cv2
 import numpy as np
-import mediapipe as mp
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.ndimage import gaussian_filter
@@ -10,9 +9,8 @@ from streamlit_drawable_canvas import st_canvas
 
 SCALE = 100.0
 
-# Инициализация MediaPipe для лиц
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# Загружаем каскад Хаара для поиска лиц (встроен в OpenCV)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 def parse_prompt(text: str) -> dict:
     params = {}
@@ -28,7 +26,7 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
 
     # 1. Шумоподавление (OpenCV)
     if do_denoise or p.get("denoise", 0) > 0:
-        h = int(p.get("denoise", 10)) # сила шума
+        h = int(p.get("denoise", 10))
         arr = cv2.fastNlMeansDenoisingColored(arr.astype(np.uint8), None, h, h, 7, 21)
         arr = arr.astype(np.float32)
 
@@ -116,38 +114,35 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
         arr = arr * (1 + (p["vignette"] / SCALE) * mask)
         img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
-    # 10. Улучшение лиц (MediaPipe)
+    # 10. Улучшение лиц (OpenCV Каскады)
     if do_faces:
-        rgb_img = np.asarray(img)
-        results = face_detection.process(rgb_img)
+        img_arr = np.asarray(img).astype(np.float32)
+        gray = cv2.cvtColor(img_arr.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        h, w = img_arr.shape[:2]
         
-        if results.detections:
-            img_arr = np.asarray(img).astype(np.float32)
-            h, w = img_arr.shape[:2]
-            
-            # Создаем пустую маску для лиц
+        # Ищем лица
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        
+        if len(faces) > 0:
             face_mask = np.zeros((h, w), dtype=np.float32)
             
-            for detection in results.detections:
-                bbox = detection.location_data.relative_bounding_box
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                width = int(bbox.width * w)
-                height = int(bbox.height * h)
+            for (x, y, w_face, h_face) in faces:
+                # Расширяем прямоугольник на 20% для захвата подбородка и лба
+                pad_w = int(w_face * 0.2)
+                pad_h = int(h_face * 0.2)
+                x1, y1 = max(0, x - pad_w), max(0, y - pad_h)
+                x2, y2 = min(w, x + w_face + pad_w), min(h, y + h_face + pad_h)
                 
-                # Рисуем белый прямоугольник на маске (с запасом)
-                cv2.rectangle(face_mask, (max(0, x-20), max(0, y-20)), 
-                              (min(w, x+width+20), min(h, y+height+20)), 1.0, -1)
+                cv2.rectangle(face_mask, (x1, y1), (x2, y2), 1.0, -1)
             
-            # Размываем маску, чтобы края были плавными
+            # Размываем маску, чтобы переходы были плавными
             face_mask = gaussian_filter(face_mask, sigma=15)
             face_mask = face_mask[:, :, None]
             
-            # Делаем лица чуть светлее и мягче (блюр для кожи)
+            # Делаем лица светлее и мягче
             face_soft = cv2.GaussianBlur(img_arr, (15, 15), 0)
-            face_bright = img_arr * 1.15 # +15% яркости на лице
+            face_bright = img_arr * 1.15
             
-            # Смешиваем: (оригинал * (1 - маска)) + (новое_лицо * маска)
             blended = img_arr * (1 - face_mask) + face_bright * face_mask * 0.7 + face_soft * face_mask * 0.3
             img = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
@@ -167,7 +162,6 @@ with col1:
         placeholder="exposure: +0.3\nshadows: +40\nvibrance: +20\n..."
     )
     
-    # Новые чекбоксы
     st.subheader("Умные функции")
     do_denoise = st.checkbox("🧹 Убрать шум (OpenCV AI)")
     do_faces = st.checkbox("👤 Улучшить лица (свет + мягкая кожа)")
@@ -205,7 +199,7 @@ if file:
         if not params and not do_denoise and not do_faces:
             st.error("Нет параметров и не выбраны умные функции!")
         else:
-            with st.spinner("Обрабатываю (нейросети работают)..."):
+            with st.spinner("Обрабатываю..."):
                 if mode == "Рисовать маску (точечно)" and canvas_result is not None and canvas_result.image_data is not None:
                     mask_raw = canvas_result.image_data[:, :, 3]
                     if mask_raw.sum() == 0:

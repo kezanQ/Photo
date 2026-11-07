@@ -186,7 +186,6 @@ def apply_params(img: Image.Image, p: dict, do_denoise=False, do_faces=False) ->
 
 def openai_edit_image(img: Image.Image, prompt: str) -> Image.Image:
     """Отправляет фото в GPTunnel для генеративного улучшения."""
-    # Приводим фото к формату PNG и размеру 1024x1024 (требование модели)
     img = img.resize((1024, 1024), Image.Resampling.LANCZOS)
     
     img_byte_arr = io.BytesIO()
@@ -195,8 +194,9 @@ def openai_edit_image(img: Image.Image, prompt: str) -> Image.Image:
     
     try:
         with st.spinner("Нейросеть творит магию (15-20 сек)..."):
+            # ВАЖНО: Изменили модель на dall-e-3
             response = client.images.edit(
-                model="gpt-image-1", # Если тут будет ошибка, попробуем dall-e-3
+                model="dall-e-3",
                 image=("image.png", img_byte_arr, "image/png"),
                 prompt=prompt,
                 n=1,
@@ -228,7 +228,7 @@ with col1:
         do_faces = st.checkbox("👤 Улучшить лица")
     else:
         st.info("💡 Опиши текстом, что хочешь изменить. Чем точнее — тем лучше.")
-        ai_prompt = st.text_area("Промт для нейросети:", "Сделай фотографию профессиональной, высокого качества. Убери цифровой шум. Сделай снег и лицо человека светлее, а гирлянду менее пересвеченной. Сохрани все детали и одежду.")
+        ai_prompt = st.text_area("Промт для нейросети:", "Сделай фотографию профессиональной, высокого качества. Убери цифровой шум. Сделай цвета насыщеннее, но не пересвечивай. Сохрани все детали, номер машины и формы в точности как на оригинале.")
 
     run = st.button("Применить", type="primary")
 

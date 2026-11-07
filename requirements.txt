@@ -4,3 +4,4 @@ numpy
 scipy
 streamlit-drawable-canvas
 opencv-contrib-python-headless
+openai
